@@ -1,0 +1,379 @@
+-- Copyright (c) 2022 ASX Operations Pty Ltd. All rights reserved.
+-- SPDX-License-Identifier: Apache-2.0
+
+module Main where
+
+--------------------------------------------------------------------------------
+import DA.List
+import DA.Optional
+import DA.Text
+import Data
+import DA.Numeric
+import DA.Set
+--------------------------------------------------------------------------------
+
+template Customer
+  with
+    customer: Party
+    customerDetails: CustomerDetails
+  where
+    signatory customer
+
+    nonconsuming choice RequestPolicy : ContractId PolicyRequest 
+      with 
+        insurer: Party
+        startDate : Date
+        endDate : Date
+        carDetails : VehicalDetails
+        excess : ExcessLevel
+
+      controller customer
+        do create PolicyRequest 
+            with 
+              customer
+              insurer 
+              startDate
+              endDate
+              carDetails
+              excess
+              customerDetails
+
+    nonconsuming choice LodgeClaim: ContractId FNOLRequest 
+        with 
+          policy: ContractId Policy
+          myRego : Text
+          location : Text
+          description: Text
+          otherDrivers :[ClaimFact]
+        controller customer
+        do 
+          policyData <- fetch policy
+          now <- getTime
+          let myFact = Fact 
+                with 
+                  insurer = policyData.insurer
+                  paymentParty = Some policyData.paymentParty
+                  rego = myRego
+                  excess = policyData.excessLevel
+                  name = this.customerDetails.fullName
+                  location = location
+                  description = description
+                          
+          let otherFacts:[Fact] = map(\i -> Fact 
+                                      with 
+                                      insurer = i.insurer
+                                      paymentParty = None
+                                      excess = NA
+                                      rego = i.rego
+                                      name = i.name
+                                      location = ""
+                                      description = "") otherDrivers 
+
+          let insurers = map(\i -> i.insurer ) otherDrivers
+          create FNOLRequest 
+            with 
+              insurer = policyData.insurer
+              policy = policy
+              facts = myFact::otherFacts
+              involvedInsurer = insurers
+              customer = customer
+
+
+template PolicyRequest
+  with
+    customer: Party
+    insurer: Party
+    startDate: Date
+    endDate: Date
+    carDetails: VehicalDetails
+    customerDetails: CustomerDetails
+    excess: ExcessLevel
+  where
+    signatory customer
+    observer insurer
+
+    choice ApprovePolicy : ContractId Policy 
+        with 
+        policyId: Text
+        paymentParty : Party
+      controller insurer 
+        do 
+          create Policy 
+            with 
+              policyId
+              customer
+              insurer
+              paymentParty
+              startDate
+              endDate
+              carDetails
+              excessLevel = excess
+              customerDetails = customerDetails
+        
+        
+    choice RejectPolicy : ()
+      controller insurer
+        do return ()
+
+template Policy
+  with
+    customer: Party
+    insurer: Party
+    paymentParty : Party
+    policyId: Text
+    carDetails : VehicalDetails
+    startDate: Date
+    endDate: Date
+    excessLevel: ExcessLevel
+    customerDetails: CustomerDetails
+  where
+    signatory customer, insurer
+    ensure endDate > startDate
+
+    key (customer, insurer) : (Party, Party)
+    maintainer (key._1)
+
+    choice Cancel : ()
+      controller customer
+      do return ()
+
+    choice Revoke : ()
+      controller insurer
+      do return ()
+      
+template FNOLRequest
+  with
+    insurer : Party
+    policy: ContractId Policy
+    facts: [Fact]
+    involvedInsurer: [Party]
+    customer: Party
+  where
+    signatory customer
+    observer insurer
+    
+    choice AcceptClaimRequest : ContractId FNOL
+        with
+          repairer : Party
+        controller insurer 
+        do
+          policyData <- fetch policy
+          assertMsg "Invalid Claim Request - submitted insurer does not match policy" (policyData.insurer == insurer)
+          assertMsg "Invalid Claim Request - submitted customer does not match policy" (policyData.customer == customer)
+
+          create FNOL 
+            with 
+              customer = customer
+              policy = policy
+              claimInsurance= insurer
+              involvedInsurer = fromList (insurer::involvedInsurer)
+              factsAndCost = map(\i -> (i,0.00)) facts
+              agreedInsurer = empty
+              repairer = repairer
+              claimAgainstParty = None
+
+template FNOL
+  with
+    customer : Party
+    repairer : Party
+    policy: ContractId Policy
+    claimInsurance : Party
+    involvedInsurer : Set Party
+    factsAndCost: [(Fact, Numeric 2)]
+    agreedInsurer : Set Party
+    claimAgainstParty : Optional Party
+  where
+    signatory claimInsurance,customer,agreedInsurer
+    observer involvedInsurer, repairer 
+
+    choice AddFact : ContractId FNOL 
+      with
+        fact : Fact
+      controller fact.insurer
+        do
+          assertMsg "Unable to modify agreed claim" (agreedInsurer /= involvedInsurer)
+          assertMsg "Invalid rego. Lenghth should be equal or less than 6 characters/digits" (DA.Text.length fact.rego <= 6)
+          assertMsg "Payment party is required" (isSome fact.paymentParty)
+          assertMsg "Submitter is not an involved party" (member fact.insurer involvedInsurer)
+
+          if isNone (find(\(i, _) -> i.insurer == fact.insurer) factsAndCost) then 
+            do
+            create this with factsAndCost = (fact,0.00) :: this.factsAndCost, agreedInsurer=empty
+          else
+            do
+            create this with factsAndCost = map(\(i, j) -> if (i.insurer == fact.insurer)
+                                                      then (fact, j) 
+                                                      else (i,j)) factsAndCost, 
+                                                  agreedInsurer = empty
+    choice AddCost : ContractId FNOL 
+      with 
+        cost : Numeric 2
+        ins : Party
+      controller repairer
+        do
+        assertMsg "Unable to modify agreed claim" (agreedInsurer /= involvedInsurer)
+        assertMsg "Insurance company is not in the claim" (isSome (find(\(i, _) -> i.insurer == ins) factsAndCost))
+
+        let f = map(\(i, j) -> if (i.insurer==ins) 
+                          then (i, cost) 
+                          else (i,j) ) this.factsAndCost
+        create this with 
+          factsAndCost = f
+          agreedInsurer= empty
+          
+    choice AgreeOnWhoToPay : Either (ContractId ClaimSettlementRequest) (ContractId FNOL)
+      with 
+        insur: Party
+        atFaultParty: Party
+      controller insur
+        do
+        assertMsg "Unable to modify agreed claim" (agreedInsurer /= involvedInsurer)
+        assertMsg ("Selected party " <> show atFaultParty <> "must from involved parties" <> show involvedInsurer) (member atFaultParty involvedInsurer)
+        assertMsg ("Payment party missing") (isNone (findIndex(\(i, _) -> isNone i.paymentParty ) factsAndCost))
+
+
+        if  (isNone claimAgainstParty || atFaultParty/= fromSome claimAgainstParty) then
+          do
+              c <- create this 
+                    with 
+                      agreedInsurer = insert insur empty
+                      claimAgainstParty = Some atFaultParty
+              return (Right c)
+        else 
+          do
+            if (member insur agreedInsurer) then
+              do 
+                a <- create this 
+                      with agreedInsurer = agreedInsurer
+                return (Right a)
+            else
+              do
+                z <- create this with agreedInsurer = insert insur agreedInsurer
+                if (insert insur agreedInsurer == involvedInsurer) then
+                    do
+                      let Some (fact, _) = find(\(i, _) -> i.insurer == fromSome claimAgainstParty) factsAndCost
+
+                      b <- create ClaimSettlementRequest 
+                            with 
+                              factsAndCost = factsAndCost
+                              atFaultParty= atFaultParty
+                              atFaultPaymentParty = fromSome fact.paymentParty
+                              claimInsurance = this.claimInsurance 
+                              customer=this.customer
+                              repairer = repairer
+                      return (Left b)
+                else
+                    do
+                      return (Right z)
+
+
+
+template ClaimSettlementRequest
+  with 
+    factsAndCost : [(Fact, Numeric 2)]
+    atFaultParty : Party
+    atFaultPaymentParty : Party
+    claimInsurance: Party
+    customer: Party
+    repairer: Party
+  where
+      signatory claimInsurance, atFaultParty
+      observer atFaultParty, atFaultPaymentParty
+
+      choice AcceptClaimSettlementRequest : ContractId ClaimSettlement
+        controller atFaultParty
+        do
+
+          let involvedParties:[Party] = concatMap (\(i, _) -> [i.insurer,fromSome i.paymentParty]) factsAndCost
+          _settlementId <- create ClaimSettlement 
+                            with 
+                            claimSettlementRequest = this
+                            settled = Settled
+                            repairer = repairer
+                            paymentParty = atFaultPaymentParty
+                            involedParties = fromList (customer :: involvedParties)
+
+          -- find the customer exccess amount
+          let Some (fact,cost) = find (\(i, _) -> i.insurer == claimInsurance) factsAndCost
+
+          _customerAccessPI <- do create PaymentInstruction 
+                                    with  
+                                    issuer = atFaultParty
+                                    payTo = fromSome fact.paymentParty
+                                    amount = cast (intToDecimal (fromEnum fact.excess)) : Numeric 2
+                                    customerName = show claimInsurance
+                                    comment = "Customer Excess"
+                                    paymentParty = atFaultPaymentParty
+                                    _settlementId = _settlementId
+
+          _repairCostPI <- mapA(\(i, j) -> do
+                                  create PaymentInstruction 
+                                    with 
+                                    payTo = fromSome i.paymentParty
+                                    amount = j
+                                    customerName = show repairer <> " - " <>show i.insurer
+                                    issuer = atFaultParty
+                                    comment = "Repair cost for " <> show i.insurer 
+                                    paymentParty = atFaultPaymentParty
+                                    _settlementId = _settlementId
+                                ) factsAndCost
+
+          pure _settlementId
+          
+
+
+template ClaimSettlement
+  with 
+      claimSettlementRequest: ClaimSettlementRequest
+      settled : SettlementLevel
+      repairer : Party
+      paymentParty : Party
+      involedParties : Set Party 
+  where
+      signatory claimSettlementRequest.atFaultParty, claimSettlementRequest.claimInsurance
+      observer repairer, involedParties
+
+template InsurancePayment
+  with
+    issuer : Party
+    from: Party
+    to: Party
+    payerName: Text
+    amount: Numeric 2
+  where
+    signatory to, issuer
+    observer from
+
+template PaymentInstruction
+  with
+    issuer: Party
+    payTo: Party
+    customerName: Text
+    amount: Numeric 2
+    paymentParty : Party
+    comment: Text
+    _settlementId : ContractId ClaimSettlement
+  where
+    signatory issuer
+    observer payTo, paymentParty
+
+    choice Accept : ContractId InsurancePayment
+      controller payTo
+      do
+
+        settlement <- fetch _settlementId
+
+        assertMsg "Issuer is not at fault party in the settlement" (settlement.claimSettlementRequest.atFaultParty == issuer)
+        assertMsg "Payer does not match with the settlement" (settlement.claimSettlementRequest.atFaultPaymentParty == paymentParty)
+
+        -- Below code used show paymentParty to display the payer's name. This is because there is no template defined to represent insurance company in this POC.
+        -- Plan to create insurance company template in the next version to hold insurance company's details
+
+        create InsurancePayment 
+          with 
+            issuer = issuer
+            from = paymentParty
+            to = payTo
+            payerName = show paymentParty
+            amount = amount
+
